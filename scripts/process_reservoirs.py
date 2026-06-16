@@ -98,40 +98,44 @@ def search_sentinel_scene(bbox):
     
     return selected
 
-def read_cropped_band(asset_href, aoi_geometry, token, out_shape=None, out_transform=None, out_crs=None):
+def download_file(url, output_path, token):
+    """Downloads a file from CDSE using the OAuth token."""
+    headers = {"Authorization": f"Bearer {token}"}
+    with requests.get(url, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        with open(output_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+def read_cropped_band(file_path, aoi_geometry, out_shape=None, out_transform=None, out_crs=None):
     """
-    Opens a remote Sentinel-2 band from CDSE using vsicurl and authorization headers,
-    and crops it to the AOI geometry.
+    Opens a local Sentinel-2 band, and crops it to the AOI geometry.
     If out_shape is provided, reprojects the band to match it.
     """
-    gdal_headers = f"Authorization: Bearer {token}"
-    vsicurl_url = f"/vsicurl/{asset_href}"
-    
-    with rasterio.Env(GDAL_HTTP_HEADERS=gdal_headers, GDAL_HTTP_UNSUPPORTED_HTTP_VERSION="HTTP/1.1"):
-        with rasterio.open(vsicurl_url) as src:
-            # Project AOI geometry to raster CRS
-            project = pyproj.Transformer.from_crs("EPSG:4326", src.crs, always_xy=True).transform
-            aoi_utm = transform(project, aoi_geometry)
+    with rasterio.open(file_path) as src:
+        # Project AOI geometry to raster CRS
+        project = pyproj.Transformer.from_crs("EPSG:4326", src.crs, always_xy=True).transform
+        aoi_utm = transform(project, aoi_geometry)
+        
+        # Crop using rasterio.mask
+        cropped_image, cropped_transform = mask(src, [aoi_utm], crop=True)
+        band_data = cropped_image[0].astype(np.float32)
+        
+        # Reproject/upsample if requested (useful for SCL 20m -> 10m alignment)
+        if out_shape is not None and band_data.shape != out_shape:
+            reprojected_band = np.zeros(out_shape, dtype=band_data.dtype)
+            reproject(
+                band_data,
+                reprojected_band,
+                src_transform=cropped_transform,
+                src_crs=src.crs,
+                dst_transform=out_transform,
+                dst_crs=out_crs,
+                resampling=Resampling.nearest
+            )
+            return reprojected_band, out_transform, out_crs
             
-            # Crop using rasterio.mask
-            cropped_image, cropped_transform = mask(src, [aoi_utm], crop=True)
-            band_data = cropped_image[0].astype(np.float32)
-            
-            # Reproject/upsample if requested (useful for SCL 20m -> 10m alignment)
-            if out_shape is not None and band_data.shape != out_shape:
-                reprojected_band = np.zeros(out_shape, dtype=band_data.dtype)
-                reproject(
-                    band_data,
-                    reprojected_band,
-                    src_transform=cropped_transform,
-                    src_crs=src.crs,
-                    dst_transform=out_transform,
-                    dst_crs=out_crs,
-                    resampling=Resampling.nearest
-                )
-                return reprojected_band, out_transform, out_crs
-                
-            return band_data, cropped_transform, src.crs
+        return band_data, cropped_transform, src.crs
 
 def process_reservoir(name, geojson_path, token):
     """Processes a single reservoir AOI: downloads, NDWI, masks clouds, calculates water area."""
@@ -167,20 +171,48 @@ def process_reservoir(name, geojson_path, token):
     b08_href = assets[b08_key]["alternate"]["https"]["href"]
     scl_href = assets[scl_key]["alternate"]["https"]["href"]
     
-    print("Streaming Green band (B03) and cropping...")
-    b03_data, b03_transform, b03_crs = read_cropped_band(b03_href, aoi_geometry, token)
+    # Create temp directory
+    temp_dir = Path("temp_bands")
+    temp_dir.mkdir(exist_ok=True)
     
-    print("Streaming NIR band (B08) and cropping...")
-    b08_data, _, _ = read_cropped_band(b08_href, aoi_geometry, token, 
-                                      out_shape=b03_data.shape, 
-                                      out_transform=b03_transform, 
-                                      out_crs=b03_crs)
-                                      
-    print("Streaming SCL band and reprojecting to 10m...")
-    scl_data, _, _ = read_cropped_band(scl_href, aoi_geometry, token,
-                                      out_shape=b03_data.shape,
-                                      out_transform=b03_transform,
-                                      out_crs=b03_crs)
+    b03_path = temp_dir / f"{name}_B03.jp2"
+    b08_path = temp_dir / f"{name}_B08.jp2"
+    scl_path = temp_dir / f"{name}_SCL.jp2"
+    
+    try:
+        print("Downloading Green band (B03) locally...")
+        download_file(b03_href, b03_path, token)
+        print("Cropping Green band (B03)...")
+        b03_data, b03_transform, b03_crs = read_cropped_band(b03_path, aoi_geometry)
+        
+        print("Downloading NIR band (B08) locally...")
+        download_file(b08_href, b08_path, token)
+        print("Cropping NIR band (B08)...")
+        b08_data, _, _ = read_cropped_band(b08_path, aoi_geometry, 
+                                          out_shape=b03_data.shape, 
+                                          out_transform=b03_transform, 
+                                          out_crs=b03_crs)
+                                          
+        print("Downloading SCL band locally...")
+        download_file(scl_href, scl_path, token)
+        print("Reprojecting SCL band to 10m...")
+        scl_data, _, _ = read_cropped_band(scl_path, aoi_geometry,
+                                          out_shape=b03_data.shape,
+                                          out_transform=b03_transform,
+                                          out_crs=b03_crs)
+    finally:
+        # Clean up temp files
+        for p in [b03_path, b08_path, scl_path]:
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception as e:
+                    print(f"Warning: Could not delete temp file {p}: {e}")
+        if temp_dir.exists() and not any(temp_dir.iterdir()):
+            try:
+                temp_dir.rmdir()
+            except Exception as e:
+                pass
     
     # 3. Process bands
     # Compute NDWI = (B03 - B08) / (B03 + B08)
