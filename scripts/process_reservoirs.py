@@ -15,6 +15,7 @@ from shapely.geometry import shape
 from shapely.ops import transform
 import pyproj
 from dotenv import load_dotenv
+import shutil
 
 # Load local .env file if it exists
 load_dotenv()
@@ -108,14 +109,14 @@ def download_file(url, output_path, token):
                 f.write(chunk)
 
 def stack_scene_if_missing(scene, token):
-    """Downloads B02, B03, B04, B08 for a scene and stacks them into a single GeoTIFF if not already present."""
+    """Downloads B02, B03, B04, B08 for a scene and stacks them into a single GeoTIFF if not already present in temp_stack."""
     scene_id = scene.get("id")
-    output_dir = Path("raw_tiles")
+    output_dir = Path("temp_stack")
     output_dir.mkdir(exist_ok=True)
     output_path = output_dir / f"{scene_id}.tif"
     
     if output_path.exists():
-        print(f"Full-tile stacked TIFF for {scene_id} already exists. Skipping download.")
+        print(f"Full-tile stacked TIFF for {scene_id} already exists in cache.")
         return output_path
         
     assets = scene.get("assets", {})
@@ -245,6 +246,13 @@ def process_reservoir(name, geojson_path, token):
         print(f"Error: Could not stack TIFF for scene {scene_id}. Skipping reservoir {name}.")
         return None
         
+    # Copy the stacked TIFF to raw_tiles with a reservoir-specific name
+    raw_tiles_dir = Path("raw_tiles")
+    raw_tiles_dir.mkdir(exist_ok=True)
+    reservoir_tiff_path = raw_tiles_dir / f"{name}_{acquisition_date}_full.tif"
+    shutil.copy(stacked_tiff_path, reservoir_tiff_path)
+    print(f"  Saved reservoir-specific full tile TIFF to {reservoir_tiff_path}")
+        
     # Get SCL asset href
     assets = scene.get("assets", {})
     scl_key = "SCL_20m" if "SCL_20m" in assets else ("SCL_60m" if "SCL_60m" in assets else "SCL")
@@ -261,11 +269,11 @@ def process_reservoir(name, geojson_path, token):
     try:
         print("Cropping Green band (B03) from stacked TIFF...")
         # B03 is Band 2 in our stacked TIFF (Blue=1, Green=2, Red=3, NIR=4)
-        b03_data, b03_transform, b03_crs = read_cropped_band(stacked_tiff_path, aoi_geometry, band_idx=2)
+        b03_data, b03_transform, b03_crs = read_cropped_band(reservoir_tiff_path, aoi_geometry, band_idx=2)
         
         print("Cropping NIR band (B08) from stacked TIFF...")
         # B08 is Band 4 in our stacked TIFF
-        b08_data, _, _ = read_cropped_band(stacked_tiff_path, aoi_geometry, band_idx=4,
+        b08_data, _, _ = read_cropped_band(reservoir_tiff_path, aoi_geometry, band_idx=4,
                                           out_shape=b03_data.shape, 
                                           out_transform=b03_transform, 
                                           out_crs=b03_crs)
@@ -511,6 +519,15 @@ def main():
         plot_history_trends(history_df)
     else:
         print("No new scenes processed successfully in this run.")
+        
+    # Clean up temp_stack directory
+    temp_stack_dir = Path("temp_stack")
+    if temp_stack_dir.exists():
+        try:
+            shutil.rmtree(temp_stack_dir)
+            print("Cleaned up temporary stacking cache.")
+        except Exception as e:
+            print(f"Warning: Could not remove temp_stack: {e}")
 
 if __name__ == "__main__":
     main()
