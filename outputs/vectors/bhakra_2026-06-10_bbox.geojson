@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "bhakra_2026-06-10_bbox",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "feature_type": "reservoir_bbox" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 76.385852144609601, 31.558742877457142 ], [ 76.385958863809648, 31.565958706249901 ], [ 76.378479295902324, 31.56603959624919 ], [ 76.378373152185276, 31.558823744739854 ], [ 76.385852144609601, 31.558742877457142 ] ] ] } }
+]
+}
