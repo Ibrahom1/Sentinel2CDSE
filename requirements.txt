@@ -7,3 +7,4 @@ requests
 shapely
 pyproj
 python-dotenv
+scipy
