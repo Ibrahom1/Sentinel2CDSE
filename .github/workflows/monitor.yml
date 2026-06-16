@@ -7,6 +7,9 @@ on:
     branches: [ master ]
   workflow_dispatch:      # Allows manual execution from the GitHub Actions tab
 
+permissions:
+  contents: write
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
