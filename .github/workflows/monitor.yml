@@ -38,6 +38,13 @@ jobs:
       run: |
         python scripts/process_reservoirs.py
 
+    - name: Upload Full Tile GeoTIFFs
+      uses: actions/upload-artifact@v4
+      with:
+        name: sentinel2-full-tiles
+        path: raw_tiles/
+        retention-days: 14
+
     - name: Commit and Push Changes
       run: |
         git config --global user.name "github-actions[bot]"

@@ -107,9 +107,91 @@ def download_file(url, output_path, token):
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-def read_cropped_band(file_path, aoi_geometry, out_shape=None, out_transform=None, out_crs=None):
+def stack_scene_if_missing(scene, token):
+    """Downloads B02, B03, B04, B08 for a scene and stacks them into a single GeoTIFF if not already present."""
+    scene_id = scene.get("id")
+    output_dir = Path("raw_tiles")
+    output_dir.mkdir(exist_ok=True)
+    output_path = output_dir / f"{scene_id}.tif"
+    
+    if output_path.exists():
+        print(f"Full-tile stacked TIFF for {scene_id} already exists. Skipping download.")
+        return output_path
+        
+    assets = scene.get("assets", {})
+    b02_key = "B02_10m" if "B02_10m" in assets else "B02"
+    b03_key = "B03_10m" if "B03_10m" in assets else "B03"
+    b04_key = "B04_10m" if "B04_10m" in assets else "B04"
+    b08_key = "B08_10m" if "B08_10m" in assets else "B08"
+    
+    if any(k not in assets for k in [b02_key, b03_key, b04_key, b08_key]):
+        print(f"Error: Missing 10m bands (B02, B03, B04, B08) in scene assets.")
+        return None
+        
+    temp_dir = Path("temp_bands")
+    temp_dir.mkdir(exist_ok=True)
+    
+    b02_path = temp_dir / f"{scene_id}_B02.jp2"
+    b03_path = temp_dir / f"{scene_id}_B03.jp2"
+    b04_path = temp_dir / f"{scene_id}_B04.jp2"
+    b08_path = temp_dir / f"{scene_id}_B08.jp2"
+    
+    try:
+        print(f"Downloading bands for full-tile stack of {scene_id}...")
+        print("  Downloading Blue band (B02)...")
+        download_file(assets[b02_key]["alternate"]["https"]["href"], b02_path, token)
+        print("  Downloading Green band (B03)...")
+        download_file(assets[b03_key]["alternate"]["https"]["href"], b03_path, token)
+        print("  Downloading Red band (B04)...")
+        download_file(assets[b04_key]["alternate"]["https"]["href"], b04_path, token)
+        print("  Downloading NIR band (B08)...")
+        download_file(assets[b08_key]["alternate"]["https"]["href"], b08_path, token)
+        
+        print("Creating compressed 4-band GeoTIFF (deflate)...")
+        with rasterio.open(b02_path) as src:
+            meta = src.meta.copy()
+            
+        meta.update(
+            count=4,
+            driver='GTiff',
+            compress='deflate',
+            predictor=2,
+            zlevel=6
+        )
+        
+        with rasterio.open(output_path, 'w', **meta) as dst:
+            for idx, path in enumerate([b02_path, b03_path, b04_path, b08_path], start=1):
+                print(f"  Writing band {idx}/4 to TIFF...")
+                with rasterio.open(path) as src_band:
+                    dst.write(src_band.read(1), idx)
+                    
+        print(f"Saved stacked TIFF to {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"Error creating stacked TIFF for {scene_id}: {e}")
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except Exception:
+                pass
+        return None
+    finally:
+        # Clean up temp JP2 files
+        for p in [b02_path, b03_path, b04_path, b08_path]:
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        if temp_dir.exists() and not any(temp_dir.iterdir()):
+            try:
+                temp_dir.rmdir()
+            except Exception:
+                pass
+
+def read_cropped_band(file_path, aoi_geometry, band_idx=1, out_shape=None, out_transform=None, out_crs=None):
     """
-    Opens a local Sentinel-2 band, and crops it to the AOI geometry.
+    Opens a local Sentinel-2 band or stacked TIFF, and crops a specific band to the AOI geometry.
     If out_shape is provided, reprojects the band to match it.
     """
     with rasterio.open(file_path) as src:
@@ -119,7 +201,7 @@ def read_cropped_band(file_path, aoi_geometry, out_shape=None, out_transform=Non
         
         # Crop using rasterio.mask
         cropped_image, cropped_transform = mask(src, [aoi_utm], crop=True)
-        band_data = cropped_image[0].astype(np.float32)
+        band_data = cropped_image[band_idx - 1].astype(np.float32)
         
         # Reproject/upsample if requested (useful for SCL 20m -> 10m alignment)
         if out_shape is not None and band_data.shape != out_shape:
@@ -157,38 +239,33 @@ def process_reservoir(name, geojson_path, token):
     scene_cloud_cover = scene_props.get("eo:cloud_cover", 0.0)
     acquisition_date = scene_props.get("datetime")[:10] # YYYY-MM-DD
     
-    # Get asset hrefs
-    assets = scene.get("assets", {})
-    b03_key = "B03_10m" if "B03_10m" in assets else "B03"
-    b08_key = "B08_10m" if "B08_10m" in assets else "B08"
-    scl_key = "SCL_20m" if "SCL_20m" in assets else ("SCL_60m" if "SCL_60m" in assets else "SCL")
-    
-    if b03_key not in assets or b08_key not in assets or scl_key not in assets:
-        print(f"Error: Missing required bands in scene assets. Required: B03, B08, SCL.")
+    # First, stack the scene if it hasn't been stacked yet
+    stacked_tiff_path = stack_scene_if_missing(scene, token)
+    if not stacked_tiff_path:
+        print(f"Error: Could not stack TIFF for scene {scene_id}. Skipping reservoir {name}.")
         return None
         
-    b03_href = assets[b03_key]["alternate"]["https"]["href"]
-    b08_href = assets[b08_key]["alternate"]["https"]["href"]
+    # Get SCL asset href
+    assets = scene.get("assets", {})
+    scl_key = "SCL_20m" if "SCL_20m" in assets else ("SCL_60m" if "SCL_60m" in assets else "SCL")
+    if scl_key not in assets:
+        print(f"Error: Missing SCL band in scene assets.")
+        return None
     scl_href = assets[scl_key]["alternate"]["https"]["href"]
     
-    # Create temp directory
+    # Create temp directory for SCL download
     temp_dir = Path("temp_bands")
     temp_dir.mkdir(exist_ok=True)
-    
-    b03_path = temp_dir / f"{name}_B03.jp2"
-    b08_path = temp_dir / f"{name}_B08.jp2"
     scl_path = temp_dir / f"{name}_SCL.jp2"
     
     try:
-        print("Downloading Green band (B03) locally...")
-        download_file(b03_href, b03_path, token)
-        print("Cropping Green band (B03)...")
-        b03_data, b03_transform, b03_crs = read_cropped_band(b03_path, aoi_geometry)
+        print("Cropping Green band (B03) from stacked TIFF...")
+        # B03 is Band 2 in our stacked TIFF (Blue=1, Green=2, Red=3, NIR=4)
+        b03_data, b03_transform, b03_crs = read_cropped_band(stacked_tiff_path, aoi_geometry, band_idx=2)
         
-        print("Downloading NIR band (B08) locally...")
-        download_file(b08_href, b08_path, token)
-        print("Cropping NIR band (B08)...")
-        b08_data, _, _ = read_cropped_band(b08_path, aoi_geometry, 
+        print("Cropping NIR band (B08) from stacked TIFF...")
+        # B08 is Band 4 in our stacked TIFF
+        b08_data, _, _ = read_cropped_band(stacked_tiff_path, aoi_geometry, band_idx=4,
                                           out_shape=b03_data.shape, 
                                           out_transform=b03_transform, 
                                           out_crs=b03_crs)
@@ -196,22 +273,21 @@ def process_reservoir(name, geojson_path, token):
         print("Downloading SCL band locally...")
         download_file(scl_href, scl_path, token)
         print("Reprojecting SCL band to 10m...")
-        scl_data, _, _ = read_cropped_band(scl_path, aoi_geometry,
+        scl_data, _, _ = read_cropped_band(scl_path, aoi_geometry, band_idx=1,
                                           out_shape=b03_data.shape,
                                           out_transform=b03_transform,
                                           out_crs=b03_crs)
     finally:
-        # Clean up temp files
-        for p in [b03_path, b08_path, scl_path]:
-            if p.exists():
-                try:
-                    p.unlink()
-                except Exception as e:
-                    print(f"Warning: Could not delete temp file {p}: {e}")
+        # Clean up temp SCL file
+        if scl_path.exists():
+            try:
+                scl_path.unlink()
+            except Exception as e:
+                print(f"Warning: Could not delete temp file {scl_path}: {e}")
         if temp_dir.exists() and not any(temp_dir.iterdir()):
             try:
                 temp_dir.rmdir()
-            except Exception as e:
+            except Exception:
                 pass
     
     # 3. Process bands

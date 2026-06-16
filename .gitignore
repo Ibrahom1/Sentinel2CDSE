@@ -1,0 +1,6 @@
+# Ignored folders for Sentinel-2 Reservoir Monitoring
+raw_tiles/
+temp_bands/
+.env
+__pycache__/
+*.pyc
