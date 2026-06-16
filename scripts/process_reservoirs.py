@@ -25,7 +25,7 @@ load_dotenv()
 # Constants
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 STAC_URL = "https://catalogue.dataspace.copernicus.eu/stac/search"
-NDWI_THRESHOLD = 0.05  # Standard threshold: water > 0.05
+NDWI_THRESHOLD = 0.00  # Lowered threshold to capture shallow/turbid water and prevent fragmentation
 LOOKBACK_DAYS = 15
 MIN_RESERVOIR_PIXELS = 500  # Minimum cluster size to be considered a reservoir (~0.05 km²)
 
@@ -58,8 +58,8 @@ def get_auth_token():
 # STAC Search
 # ──────────────────────────────────────────────
 
-def search_sentinel_scene(bbox):
-    """Searches for the newest, clearest Sentinel-2 L2A scene over the bbox."""
+def search_sentinel_scene(bbox, aoi_geometry):
+    """Searches for the newest, clearest Sentinel-2 L2A scene that covers the AOI."""
     end_date = datetime.datetime.now(datetime.timezone.utc)
     start_date = end_date - datetime.timedelta(days=LOOKBACK_DAYS)
 
@@ -69,7 +69,7 @@ def search_sentinel_scene(bbox):
         "collections": ["sentinel-2-l2a"],
         "bbox": bbox,
         "datetime": datetime_range,
-        "limit": 20
+        "limit": 30
     }
 
     print(f"Searching for scenes between {start_date.date()} and {end_date.date()}...")
@@ -83,25 +83,59 @@ def search_sentinel_scene(bbox):
     print(f"Found {len(features)} candidate scenes.")
 
     valid_scenes = []
+    max_coverage = 0.0
+    best_coverage_feat = None
+
     for feat in features:
         props = feat.get("properties", {})
         cloud_cover = props.get("eo:cloud_cover", 100.0)
         dt_str = props.get("datetime")
-        valid_scenes.append((feat, cloud_cover, dt_str))
+        
+        # Calculate coverage of the AOI
+        scene_geom_raw = feat.get("geometry")
+        if scene_geom_raw:
+            scene_geom = shape(scene_geom_raw)
+            coverage = scene_geom.intersection(aoi_geometry).area / aoi_geometry.area
+        else:
+            coverage = 0.0
+            
+        if coverage > max_coverage:
+            max_coverage = coverage
+            best_coverage_feat = feat
+            
+        # We want scenes covering at least 95% of our AOI
+        if coverage >= 0.95:
+            valid_scenes.append((feat, cloud_cover, dt_str, coverage))
+        else:
+            print(f"  Scene {feat.get('id')} covers only {coverage*100:.1f}% of AOI. Skipping.")
+
+    # Fallback if no scene covers >= 95%
+    if not valid_scenes and best_coverage_feat is not None:
+        print(f"  No single scene covers >= 95% of AOI. Falling back to scene with max coverage ({max_coverage*100:.1f}%).")
+        props = best_coverage_feat.get("properties", {})
+        cloud_cover = props.get("eo:cloud_cover", 100.0)
+        dt_str = props.get("datetime")
+        valid_scenes.append((best_coverage_feat, cloud_cover, dt_str, max_coverage))
+
+    if not valid_scenes:
+        return None
 
     # Prefer scenes under 25% cloud, sorted by newest first
     clear_scenes = [s for s in valid_scenes if s[1] < 25.0]
     if clear_scenes:
         clear_scenes.sort(key=lambda x: x[2], reverse=True)
         selected = clear_scenes[0][0]
+        selected_coverage = clear_scenes[0][3]
     else:
         valid_scenes.sort(key=lambda x: x[1])
         selected = valid_scenes[0][0]
+        selected_coverage = valid_scenes[0][3]
 
     props = selected.get("properties", {})
     print(f"Selected Scene: {selected.get('id')}")
     print(f"  Acquisition Date: {props.get('datetime')}")
     print(f"  Scene Cloud Cover: {props.get('eo:cloud_cover')}%")
+    print(f"  AOI Coverage: {selected_coverage*100:.1f}%")
 
     return selected
 
@@ -226,34 +260,61 @@ def read_cropped_band(file_path, aoi_geometry, band_idx=1,
 # Reservoir detection (largest connected water cluster)
 # ──────────────────────────────────────────────
 
-def detect_reservoir_cluster(water_mask):
+def detect_reservoir_cluster(water_mask, cloud_mask):
     """
-    Uses connected-component labeling to find the largest contiguous
-    water body (the reservoir) among all detected water pixels.
-    Returns:
-        reservoir_mask  – boolean array, True only for the reservoir cluster
-        cluster_label   – integer label of the reservoir cluster
-        num_clusters    – total number of water clusters found
+    Uses morphological closing and cloud-bridging connected-component labeling
+    to find the largest contiguous water body (the reservoir), catering for cloud cover.
     """
-    # Label connected components (8-connectivity)
+    # 1. Dilate the visible water mask by 25 pixels (250m) to create an active reservoir buffer.
+    # This prevents clouds on surrounding hills from bridging or inflating the reservoir area.
+    water_dilation = ndimage.binary_dilation(water_mask, structure=np.ones((25, 25), dtype=bool))
+
+    # 2. Filter clouds/shadows to only those within the active reservoir buffer
+    reservoir_clouds = cloud_mask & water_dilation
+
+    # 3. Create a connectivity mask combining visible water and adjacent reservoir clouds
+    connectivity_mask = water_mask | reservoir_clouds
+
+    # 4. Apply binary closing to bridge small remaining gaps (e.g. sandbars, noise)
+    # A 7x7 structuring element bridges gaps up to 6 pixels (60m)
+    closing_structure = np.ones((7, 7), dtype=bool)
+    closed_water = ndimage.binary_closing(connectivity_mask, structure=closing_structure)
+
+    # 5. Label connected components (8-connectivity)
     structure = ndimage.generate_binary_structure(2, 2)
-    labeled_array, num_clusters = ndimage.label(water_mask.astype(np.int32), structure=structure)
+    labeled_array, num_clusters = ndimage.label(closed_water.astype(np.int32), structure=structure)
 
     if num_clusters == 0:
         return np.zeros_like(water_mask, dtype=bool), 0, 0
 
-    # Find the largest cluster
-    cluster_sizes = ndimage.sum(water_mask, labeled_array, range(1, num_clusters + 1))
-    largest_label = np.argmax(cluster_sizes) + 1  # labels are 1-indexed
+    # 6. Find the largest cluster in the closed connectivity mask
+    cluster_sizes = ndimage.sum(closed_water, labeled_array, range(1, num_clusters + 1))
+    largest_label = np.argmax(cluster_sizes) + 1
     largest_size = int(cluster_sizes[largest_label - 1])
 
-    print(f"  Connected-component analysis: {num_clusters} water clusters found")
-    print(f"  Largest cluster: label={largest_label}, pixels={largest_size} ({largest_size * 100 / 1e6:.4f} km²)")
+    print(f"  Connected-component analysis (closed): {num_clusters} water/cloud clusters found")
+    print(f"  Largest closed cluster: label={largest_label}, pixels={largest_size} ({largest_size * 100 / 1e6:.4f} km²)")
 
     if largest_size < MIN_RESERVOIR_PIXELS:
         print(f"  WARNING: Largest cluster ({largest_size} px) is below minimum threshold ({MIN_RESERVOIR_PIXELS} px)")
 
-    reservoir_mask = (labeled_array == largest_label)
+    # 7. Define the reservoir mask
+    # This includes both visible water and the cloud pixels that are part of the reservoir cluster
+    closed_reservoir_mask = (labeled_array == largest_label)
+
+    # We count visible water + any cloud pixels that fell within this cluster (estimated water under clouds)
+    reservoir_mask = closed_reservoir_mask & (water_mask | reservoir_clouds)
+
+    # Recalculate and print sizes
+    reservoir_pixels = int(np.sum(reservoir_mask))
+    visible_pixels = int(np.sum(closed_reservoir_mask & water_mask))
+    cloud_pixels = int(np.sum(closed_reservoir_mask & reservoir_clouds))
+
+    print(f"  Reservoir detection summary:")
+    print(f"    Visible water pixels: {visible_pixels} ({visible_pixels * 100 / 1e6:.4f} km²)")
+    print(f"    Cloud-covered pixels: {cloud_pixels} ({cloud_pixels * 100 / 1e6:.4f} km²)")
+    print(f"    Total reservoir pixels: {reservoir_pixels} ({reservoir_pixels * 100 / 1e6:.4f} km²)")
+
     return reservoir_mask, largest_label, num_clusters
 
 
@@ -423,7 +484,7 @@ def process_reservoir(name, geojson_path, token):
     bbox = list(gdf.total_bounds)
 
     # 2. Search for scene
-    scene = search_sentinel_scene(bbox)
+    scene = search_sentinel_scene(bbox, aoi_geometry)
     if not scene:
         print(f"No Sentinel-2 scenes found in the last {LOOKBACK_DAYS} days for {name}.")
         return None
@@ -492,7 +553,8 @@ def process_reservoir(name, geojson_path, token):
     ndwi = np.where(denom == 0, 0, (b03_data - b08_data) / denom)
 
     # 7. Cloud masking
-    cloud_classes = [0, 1, 3, 8, 9, 10]
+    # SCL Classes: 1=Saturated/Defective, 2=Cast Shadow, 3=Cloud Shadow, 8=Cloud Medium Prob, 9=Cloud High Prob, 10=Thin Cirrus (0 is NO_DATA, excluded to prevent edge-bridging)
+    cloud_classes = [1, 2, 3, 8, 9, 10]
     cloud_mask = np.isin(scl_data, cloud_classes)
     nodata_mask = (b03_data == 0) | (b08_data == 0)
     valid_pixels = ~(cloud_mask | nodata_mask)
@@ -508,9 +570,9 @@ def process_reservoir(name, geojson_path, token):
 
     print(f"  Total water in AOI: {total_water_pixels} pixels = {total_water_area_km2:.4f} km²")
 
-    # 9. Detect the reservoir (largest connected water cluster)
-    print("  Running reservoir detection (connected-component analysis)...")
-    reservoir_mask, cluster_label, num_clusters = detect_reservoir_cluster(water_mask)
+    # 9. Detect the reservoir (largest connected water cluster with cloud bridging)
+    print("  Running reservoir detection (connected-component analysis with cloud bridging)...")
+    reservoir_mask, cluster_label, num_clusters = detect_reservoir_cluster(water_mask, cloud_mask)
 
     reservoir_pixels = int(np.sum(reservoir_mask))
     reservoir_area_km2 = reservoir_pixels * 100.0 / 1_000_000.0
