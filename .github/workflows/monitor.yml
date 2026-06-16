@@ -3,6 +3,8 @@ name: Sentinel-2 Reservoir Monitoring
 on:
   schedule:
     - cron: '0 0 */7 * *'  # Runs approximately every 7 days
+  push:
+    branches: [ master ]
   workflow_dispatch:      # Allows manual execution from the GitHub Actions tab
 
 jobs:
